@@ -351,12 +351,13 @@ install_apps() {
 
 update_apps() {
   local entry id label kind source exe alternatives data pkg current latest version url hash algo
-  local alts alt_version pending=()
+  local alts alt_version pending=() installed_count=0
   for entry in "${APPS[@]}"; do
     read_app "$entry"
     pkg=$(package_name "$id" "$kind" "$source")
     current=$(installed_version "$pkg")
     alts=$(alternatives_installed "$alternatives" | xargs)
+    [[ -n $current || -n $alts ]] && installed_count=$((installed_count + 1))
 
     if [[ -z $current && -n $alts ]]; then
       alt_version=$(installed_version "${alts%% *}")
@@ -384,6 +385,17 @@ update_apps() {
       echo "$label: $current is up to date"
     fi
   done
+
+  # Nothing to update on a machine without Proton apps, so offer to install some
+  if (( installed_count == 0 )); then
+    say "No Proton apps are installed."
+    if [[ $mode == check ]]; then
+      echo "Run 'proton-apps-update --install' to choose apps to install."
+    elif confirm "Choose Proton apps to install now?"; then
+      install_apps
+    fi
+    return 0
+  fi
 
   if (( ${#pending[@]} == 0 )); then
     say "All installed Proton apps are up to date."
