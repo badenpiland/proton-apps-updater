@@ -45,10 +45,10 @@ This copies `proton-apps-update` to `~/.local/bin/` and adds `install.proton`, `
 proton-apps-update --install
 ```
 
-This shows a checklist of every Proton app that isn't installed yet. Select apps with space and confirm with enter.
+This shows a checklist of every Proton app that isn't installed yet. Mark apps with tab and confirm with enter.
 
 ```
-Select Proton apps to install (space to select, enter to confirm)
+Select Proton apps to install (tab to select, enter to confirm)
 > [ ] Proton Mail
   [ ] Proton Pass — replaces proton-pass-bin
   [ ] Proton Authenticator

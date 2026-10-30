@@ -278,7 +278,7 @@ install_packages() {
 choose_many() {
   local header=$1; shift
   if command -v gum >/dev/null && [[ -t 0 ]]; then
-    gum choose --no-limit --header "$header (space to select, enter to confirm)" "$@" || true
+    gum choose --no-limit --header "$header (tab to select, enter to confirm)" "$@" || true
   else
     local i=1 line picks
     echo "$header" >&2
