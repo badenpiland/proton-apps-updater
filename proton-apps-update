@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install and update Proton's Linux apps from Proton's official releases.
+# Install, update and remove Proton's Linux apps from official sources.
 #
 # Proton doesn't publish Arch packages for most of its apps, so this
 # repackages the official .deb (or standalone binary), checksum-verified
@@ -8,28 +8,38 @@
 # Proton VPN and Bridge come from Arch's official repos instead and are
 # kept current by normal system updates.
 #
-# Usage: proton-apps-update [--check] [--yes] [--install]
+# AUR builds of the same apps (e.g. proton-pass-bin) are replaced with the
+# official build automatically.
+#
+# Usage: proton-apps-update [--check] [--yes] [--install] [--remove]
 #   --check    only report installed vs. latest stable versions
 #   --yes      don't ask for confirmation before installing updates
 #   --install  pick Proton apps to install from a list
+#   --remove   pick Proton apps to uninstall from a list
 
 set -euo pipefail
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/proton-apps-update"
 
-# id|label|kind|source|main executable
-#   deb  — official .deb from a Proton release feed, repackaged as <id>-official
-#   bin  — official standalone binary from a Proton release feed, packaged as <id>-official
-#   repo — package from Arch's official repos (updated by system updates)
+# id|label|kind|source|main executable|alternative builds|data folders
+#   kind:
+#     deb     — official .deb from a Proton release feed, repackaged as <id>-official
+#     bin     — official standalone binary from a Proton release feed, packaged as <id>-official
+#     passcli — like bin, from the Pass CLI's own feed format
+#     repo    — package from Arch's official repos (updated by system updates)
+#   alternative builds: space-separated packages (usually AUR) that provide the
+#     same app and get replaced by the official build
+#   data folders: colon-separated, relative to $HOME, offered for deletion on removal
 APPS=(
-  "proton-mail|Proton Mail|deb|https://proton.me/download/mail/linux/version.json|/usr/lib/proton-mail/Proton Mail Beta"
-  "proton-pass|Proton Pass|deb|https://proton.me/download/PassDesktop/linux/x64/version.json|/usr/lib/proton-pass/Proton Pass"
-  "proton-authenticator|Proton Authenticator|deb|https://proton.me/download/authenticator/linux/version.json|/usr/bin/proton-authenticator"
-  "proton-meet|Proton Meet|deb|https://proton.me/download/meet/linux/version.json|/usr/lib/proton-meet/Proton Meet Beta"
-  "proton-drive-cli|Proton Drive (CLI)|bin|https://proton.me/download/drive/cli/version.json|/usr/bin/proton-drive"
-  "proton-vpn|Proton VPN|repo|proton-vpn-gtk-app|"
-  "proton-vpn-cli|Proton VPN (CLI)|repo|proton-vpn-cli|"
-  "protonmail-bridge|Proton Mail Bridge|repo|protonmail-bridge|"
+  "proton-mail|Proton Mail|deb|https://proton.me/download/mail/linux/version.json|/usr/lib/proton-mail/Proton Mail Beta|proton-mail proton-mail-bin proton-mail-git|.config/Proton Mail"
+  "proton-pass|Proton Pass|deb|https://proton.me/download/PassDesktop/linux/x64/version.json|/usr/lib/proton-pass/Proton Pass|proton-pass proton-pass-bin proton-pass-git|.config/Proton Pass"
+  "proton-authenticator|Proton Authenticator|deb|https://proton.me/download/authenticator/linux/version.json|/usr/bin/proton-authenticator|proton-authenticator proton-authenticator-bin proton-authenticator-git|.local/share/me.proton.authenticator:.config/me.proton.authenticator:.cache/me.proton.authenticator"
+  "proton-meet|Proton Meet|deb|https://proton.me/download/meet/linux/version.json|/usr/lib/proton-meet/Proton Meet Beta|proton-meet proton-meet-bin|.config/Proton Meet"
+  "proton-drive-cli|Proton Drive (CLI)|bin|https://proton.me/download/drive/cli/version.json|/usr/bin/proton-drive|proton-drive-cli proton-drive-cli-bin proton-drive-cli-git|"
+  "proton-pass-cli|Proton Pass (CLI)|passcli|https://proton.me/download/pass-cli/versions.json|/usr/bin/pass-cli|proton-pass-cli proton-pass-cli-bin|"
+  "proton-vpn|Proton VPN|repo|proton-vpn-gtk-app|||.config/Proton/VPN:.cache/Proton/VPN:.local/state/Proton/VPN"
+  "proton-vpn-cli|Proton VPN (CLI)|repo|proton-vpn-cli|||.config/Proton/VPN:.cache/Proton/VPN:.local/state/Proton/VPN"
+  "protonmail-bridge|Proton Mail Bridge|repo|protonmail-bridge||protonmail-bridge-bin|.config/protonmail/bridge-v3:.local/share/protonmail/bridge-v3:.cache/protonmail/bridge-v3"
 )
 
 ELECTRON_DEPENDS="'alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'expat' 'glib2' 'glibc' 'gtk3' 'libcups' 'libdrm' 'libgcc' 'libnotify' 'libudev.so' 'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxfixes' 'libxkbcommon' 'libxrandr' 'libxtst' 'mesa' 'nspr' 'nss' 'pango' 'xdg-utils'"
@@ -41,8 +51,9 @@ for arg in "$@"; do
   case "$arg" in
     --check) mode=check ;;
     --install) mode=install ;;
+    --remove) mode=remove ;;
     -y|--yes) assume_yes=true ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -63,20 +74,32 @@ confirm() {
   fi
 }
 
-# Prints "version url sha512" for the newest Stable release of an app in its feed
+# Loads one APPS entry into id, label, kind, source, exe, alternatives, data
+read_app() {
+  IFS='|' read -r id label kind source exe alternatives data <<<"$1"
+}
+
+# Prints "version url hash algorithm" for the newest Stable release in a feed
 latest_stable() {
-  local kind=$1 feed=$2
-  curl -fsSL --retry 2 "$feed" | jq -r --arg kind "$kind" '
+  local kind=$1 feed=$2 json
+  json=$(curl -fsSL --retry 2 "$feed") || return 1
+
+  if [[ $kind == passcli ]]; then
+    jq -r '.passCliVersions | "\(.version) \(.urls.linux.x86_64.url) \(.urls.linux.x86_64.hash) sha256"' <<<"$json"
+    return
+  fi
+
+  jq -r --arg kind "$kind" '
     [.Releases[] | select(.CategoryName == "Stable")
       | {v: .Version, f: ([(.File // .Files)[]
           | select(if $kind == "bin" then .Platform == "linux/x64"
                    else (.Identifier // "" | test("deb")) end)][0])}
       | select(.f != null)]
     | sort_by(.v | split(".") | map(tonumber? // 0)) | last
-    | "\(.v) \(.f.Url) \(.f.Sha512CheckSum)"'
+    | "\(.v) \(.f.Url) \(.f.Sha512CheckSum) sha512"' <<<"$json"
 }
 
-# The pacman package an app is installed as, managed by this script or the repos
+# The pacman package an app is installed as when it comes from official sources
 package_name() {
   [[ $2 == repo ]] && echo "$3" || echo "$1-official"
 }
@@ -85,39 +108,69 @@ installed_version() {
   { pacman -Q "$1" 2>/dev/null || true; } | awk '{print $2}' | sed 's/-[0-9]*$//'
 }
 
-# Another package providing the same app (e.g. an AUR -bin build), if any
-other_install() {
-  pacman -Qq 2>/dev/null | grep -E "^$1(-bin|-beta-bin|-git)?\$" | grep -vx "$1-official" | head -1 || true
+# Which of an app's alternative builds are installed (space-separated list in, lines out)
+alternatives_installed() {
+  local pkg
+  for pkg in $1; do
+    pacman -Q "$pkg" &>/dev/null && echo "$pkg"
+  done
+  return 0
 }
 
-# PIDs whose executable is the app's main binary (Electron children included)
+# PIDs whose executable is a file owned by the given package (Electron children included)
 app_pids() {
-  local pid
+  local -A owned=()
+  local file pid exe
+  while IFS= read -r file; do
+    [[ -f $file && -x $file ]] && owned[$file]=1
+  done < <(pacman -Qlq "$1" 2>/dev/null || true)
+  (( ${#owned[@]} )) || return 0
+
   for pid in /proc/[0-9]*; do
-    [[ "$(readlink "$pid/exe" 2>/dev/null)" == "$1"* ]] && echo "${pid#/proc/}"
+    exe=$(readlink "$pid/exe" 2>/dev/null) || continue
+    exe=${exe% (deleted)}
+    [[ -n ${owned[$exe]:-} ]] && echo "${pid#/proc/}"
   done
   return 0
 }
 
 stop_app() {
-  local label=$1 exe=$2 pids
-  pids=$(app_pids "$exe")
+  local label=$1 pkg=$2 pids
+  pids=$(app_pids "$pkg")
   [[ -z $pids ]] && return 0
   say "Closing $label..."
   kill $pids 2>/dev/null || true
   for _ in $(seq 20); do
-    [[ -z "$(app_pids "$exe")" ]] && return 0
+    [[ -z "$(app_pids "$pkg")" ]] && return 0
     sleep 0.5
   done
-  pids=$(app_pids "$exe")
+  pids=$(app_pids "$pkg")
   [[ -n $pids ]] && kill -9 $pids 2>/dev/null || true
 }
 
-write_pkgbuild() {
-  local id=$1 label=$2 kind=$3 exe=$4 version=$5 url=$6 sha=$7
-  local file depends
+pkg_add() {
+  if command -v omarchy-pkg-add >/dev/null; then
+    omarchy-pkg-add "$@"
+  else
+    sudo pacman -S --noconfirm --needed "$@"
+  fi
+}
 
-  if [[ $kind == bin ]]; then
+pkg_drop() {
+  if command -v omarchy-pkg-drop >/dev/null; then
+    omarchy-pkg-drop "$@"
+  else
+    sudo pacman -Rns --noconfirm "$@"
+  fi
+}
+
+write_pkgbuild() {
+  local id=$1 label=$2 kind=$3 exe=$4 alternatives=$5 version=$6 url=$7 hash=$8 algo=$9
+  local file depends conflicts="" alt
+
+  for alt in $alternatives; do conflicts+="'$alt' "; done
+
+  if [[ $kind != deb ]]; then
     file="${id}_${version}"
     cat <<EOF
 pkgname=$id-official
@@ -129,10 +182,10 @@ url="https://proton.me"
 license=('custom')
 depends=('glibc')
 provides=('$id')
-conflicts=('$id' '$id-bin')
+conflicts=(${conflicts% })
 options=('!strip' '!debug')
 source=("$file::$url")
-sha512sums=('$sha')
+${algo}sums=('$hash')
 
 package() {
   install -Dm755 "$file" "\$pkgdir$exe"
@@ -153,10 +206,10 @@ url="https://proton.me"
 license=('custom')
 depends=($depends)
 provides=('$id')
-conflicts=('$id' '$id-bin' '$id-beta-bin')
+conflicts=(${conflicts% })
 options=('!strip' '!debug')
 source=("$file::$url")
-sha512sums=('$sha')
+${algo}sums=('$hash')
 noextract=("$file")
 
 package() {
@@ -186,6 +239,41 @@ build_package() {
   ls "$dir"/*.pkg.tar.zst
 }
 
+# Fetches the latest release of an app and builds it; prints the package path
+fetch_and_build() {
+  local latest version url hash algo
+  if ! latest=$(latest_stable "$kind" "$source") || [[ -z $latest || $latest == null* ]]; then
+    echo "$label: couldn't read Proton's release feed — skipping" >&2
+    return 1
+  fi
+  read -r version url hash algo <<<"$latest"
+  say "Downloading and packaging $label $version..." >&2
+  build_package "$id" "$label" "$kind" "$exe" "$alternatives" "$version" "$url" "$hash" "$algo"
+}
+
+# Installs built packages (atomically replacing conflicting AUR builds) and
+# repo packages (removing their AUR alternatives first)
+install_packages() {
+  local -n _built=$1 _repo=$2 _repo_alts=$3
+
+  # --ask=4 auto-accepts pacman's "remove conflicting package?" question, so an
+  # AUR build is swapped for the official one in a single transaction
+  if (( ${#_built[@]} )); then
+    sudo pacman -U --noconfirm --ask=4 "${_built[@]}"
+  fi
+
+  if (( ${#_repo_alts[@]} )); then
+    sudo pacman -Rdd --noconfirm "${_repo_alts[@]}"
+  fi
+  if (( ${#_repo[@]} )); then
+    pkg_add "${_repo[@]}" || {
+      (( ${#_repo_alts[@]} )) && echo "Removed ${_repo_alts[*]} but couldn't install ${_repo[*]}. Reinstall the old build from your AUR helper's cache if needed." >&2
+      return 1
+    }
+  fi
+  return 0
+}
+
 # Lets the user pick from "label — status" lines; prints the chosen lines
 choose_many() {
   local header=$1; shift
@@ -195,23 +283,31 @@ choose_many() {
     local i=1 line picks
     echo "$header" >&2
     for line in "$@"; do echo "  $i) $line" >&2; i=$((i + 1)); done
-    read -rp "Numbers separated by spaces (blank to cancel): " picks
+    read -rp "Numbers separated by spaces (blank for none): " picks
     for i in $picks; do
       if [[ $i =~ ^[0-9]+$ ]] && (( i >= 1 && i <= $# )); then echo "${!i}"; fi
     done
   fi
 }
 
+# Whether a label was among the picked lines (exact, or followed by " — ...")
+picked_label() {
+  local line
+  while IFS= read -r line; do
+    [[ $line == "$1" || $line == "$1 — "* ]] && return 0
+  done <<<"$2"
+  return 1
+}
+
 install_apps() {
-  local entry id label kind source exe pkg current other choices=() picked
+  local entry id label kind source exe alternatives data pkg alts choices=() picked
   for entry in "${APPS[@]}"; do
-    IFS='|' read -r id label kind source exe <<<"$entry"
+    read_app "$entry"
     pkg=$(package_name "$id" "$kind" "$source")
-    current=$(installed_version "$pkg")
-    [[ -n $current ]] && continue
-    other=$([[ $kind == repo ]] || other_install "$id")
-    if [[ -n $other ]]; then
-      choices+=("$label — replaces $other")
+    [[ -n "$(installed_version "$pkg")" ]] && continue
+    alts=$(alternatives_installed "$alternatives" | xargs)
+    if [[ -n $alts ]]; then
+      choices+=("$label — replaces $alts")
     elif [[ $kind == repo ]]; then
       choices+=("$label — from Arch repos")
     else
@@ -220,71 +316,70 @@ install_apps() {
   done
 
   if (( ${#choices[@]} == 0 )); then
-    say "Every Proton app is already installed."
+    say "Every Proton app is already installed from official sources."
     return 0
   fi
 
   picked=$(choose_many "Select Proton apps to install" "${choices[@]}")
   [[ -z $picked ]] && { echo "Nothing selected."; return 0; }
 
-  local packages=() repo_packages=() version url sha latest line selected
+  local packages=() repo_packages=() repo_alts=() replaced=() pkgfile
   for entry in "${APPS[@]}"; do
-    IFS='|' read -r id label kind source exe <<<"$entry"
-    selected=false
-    while IFS= read -r line; do
-      [[ $line == "$label" || $line == "$label — "* ]] && selected=true
-    done <<<"$picked"
-    $selected || continue
+    read_app "$entry"
+    picked_label "$label" "$picked" || continue
+    pkg=$(package_name "$id" "$kind" "$source")
+    [[ -n "$(installed_version "$pkg")" ]] && continue
 
+    mapfile -t alts < <(alternatives_installed "$alternatives")
+    replaced+=("${alts[@]}")
     if [[ $kind == repo ]]; then
       repo_packages+=("$source")
-      continue
+      repo_alts+=("${alts[@]}")
+    else
+      pkgfile=$(fetch_and_build) || continue
+      packages+=("$pkgfile")
     fi
-    if ! latest=$(latest_stable "$kind" "$source") || [[ -z $latest || $latest == null* ]]; then
-      echo "$label: couldn't read Proton's release feed — skipping" >&2
-      continue
-    fi
-    read -r version url sha <<<"$latest"
-    say "Downloading and packaging $label $version..."
-    packages+=("$(build_package "$id" "$label" "$kind" "$exe" "$version" "$url" "$sha")")
   done
 
   (( ${#packages[@]} + ${#repo_packages[@]} == 0 )) && return 1
+  (( ${#replaced[@]} )) && echo "Replacing ${replaced[*]} with official builds (app data is kept)."
   sudo -v
-  # No --noconfirm: pacman asks before replacing a conflicting AUR build
-  (( ${#packages[@]} )) && sudo pacman -U "${packages[@]}"
-  (( ${#repo_packages[@]} )) && sudo pacman -S --needed "${repo_packages[@]}"
+  install_packages packages repo_packages repo_alts
 
   say "Done. Keep them current with 'proton-apps-update' (VPN and Bridge update with your system)."
 }
 
 update_apps() {
-  local entry id label kind source exe pkg current other latest version url sha pending=()
+  local entry id label kind source exe alternatives data pkg current latest version url hash algo
+  local alts alt_version pending=()
   for entry in "${APPS[@]}"; do
-    IFS='|' read -r id label kind source exe <<<"$entry"
+    read_app "$entry"
     pkg=$(package_name "$id" "$kind" "$source")
     current=$(installed_version "$pkg")
+    alts=$(alternatives_installed "$alternatives" | xargs)
+
+    if [[ -z $current && -n $alts ]]; then
+      alt_version=$(installed_version "${alts%% *}")
+      echo "$label: $alts $alt_version → official build"
+      pending+=("$entry")
+      continue
+    fi
 
     if [[ $kind == repo ]]; then
       [[ -n $current ]] && echo "$label: $current (updated with system updates)"
       continue
     fi
-
-    if [[ -z $current ]]; then
-      other=$(other_install "$id")
-      [[ -n $other ]] && echo "$label: installed as '$other' — run 'proton-apps-update --install' to switch to the official build"
-      continue
-    fi
+    [[ -z $current ]] && continue
 
     if ! latest=$(latest_stable "$kind" "$source") || [[ -z $latest || $latest == null* ]]; then
       echo "$label: couldn't read Proton's release feed" >&2
       continue
     fi
-    read -r version url sha <<<"$latest"
+    read -r version url hash algo <<<"$latest"
 
     if (( $(vercmp "$version" "$current") > 0 )); then
       echo "$label: $current → $version"
-      pending+=("$entry|$version|$url|$sha")
+      pending+=("$entry")
     else
       echo "$label: $current is up to date"
     fi
@@ -297,11 +392,17 @@ update_apps() {
   [[ $mode == check ]] && return 0
   confirm "Install ${#pending[@]} update(s)?" || return 0
 
-  local packages=()
+  local packages=() repo_packages=() repo_alts=() pkgfile
   for entry in "${pending[@]}"; do
-    IFS='|' read -r id label kind source exe version url sha <<<"$entry"
-    say "Downloading and packaging $label $version..."
-    packages+=("$(build_package "$id" "$label" "$kind" "$exe" "$version" "$url" "$sha")")
+    read_app "$entry"
+    mapfile -t alts < <(alternatives_installed "$alternatives")
+    if [[ $kind == repo ]]; then
+      repo_packages+=("$source")
+      repo_alts+=("${alts[@]}")
+    else
+      pkgfile=$(fetch_and_build) || continue
+      packages+=("$pkgfile")
+    fi
   done
 
   # Ask for the password before closing anything, so a cancelled prompt leaves apps running
@@ -309,14 +410,17 @@ update_apps() {
 
   local relaunch=()
   for entry in "${pending[@]}"; do
-    IFS='|' read -r id label kind source exe _ <<<"$entry"
-    [[ $kind == deb && -n "$(app_pids "$exe")" ]] || continue
+    read_app "$entry"
+    [[ $kind == deb ]] || continue
+    pkg=$(package_name "$id" "$kind" "$source")
+    pacman -Q "$pkg" &>/dev/null || pkg=$(alternatives_installed "$alternatives" | head -1)
+    [[ -n "$(app_pids "$pkg")" ]] || continue
     relaunch+=("$id")
-    stop_app "$label" "$exe"
+    stop_app "$label" "$pkg"
   done
 
   say "Installing..."
-  sudo pacman -U --noconfirm "${packages[@]}"
+  install_packages packages repo_packages repo_alts
 
   for id in "${relaunch[@]}"; do
     say "Restarting $id..."
@@ -325,13 +429,93 @@ update_apps() {
 
   say "Done."
   for entry in "${pending[@]}"; do
-    IFS='|' read -r id label _ <<<"$entry"
-    echo "  $label $(installed_version "$id-official")"
+    read_app "$entry"
+    echo "  $label $(installed_version "$(package_name "$id" "$kind" "$source")")"
   done
 }
 
-if [[ $mode == install ]]; then
-  install_apps
-else
-  update_apps
-fi
+remove_apps() {
+  local entry id label kind source exe alternatives data pkg version dir dirs choices=() data_choices=()
+  local -A pkg_of=() dirs_of=()
+  for entry in "${APPS[@]}"; do
+    read_app "$entry"
+    pkg=$(package_name "$id" "$kind" "$source")
+    pacman -Q "$pkg" &>/dev/null || pkg=$(alternatives_installed "$alternatives" | head -1)
+    [[ -n $pkg ]] || continue
+    version=$(installed_version "$pkg")
+    choices+=("$label — $pkg $version")
+    pkg_of[$label]=$pkg
+  done
+
+  if (( ${#choices[@]} == 0 )); then
+    say "No Proton apps are installed."
+    return 0
+  fi
+
+  local picked
+  picked=$(choose_many "Select Proton apps to remove" "${choices[@]}")
+  [[ -z $picked ]] && { echo "Nothing selected."; return 0; }
+
+  local remove_entries=() packages=()
+  for entry in "${APPS[@]}"; do
+    read_app "$entry"
+    [[ -n ${pkg_of[$label]:-} ]] && picked_label "$label" "$picked" || continue
+    remove_entries+=("$entry")
+    packages+=("${pkg_of[$label]}")
+
+    local existing=()
+    IFS=: read -ra dirs <<<"$data"
+    for dir in "${dirs[@]}"; do
+      [[ -n $dir && -d "$HOME/$dir" ]] && existing+=("$HOME/$dir")
+    done
+    if (( ${#existing[@]} )); then
+      dirs_of[$label]=$(printf '%s\n' "${existing[@]}")
+      data_choices+=("$label — ${existing[*]/#$HOME/\~}")
+    fi
+  done
+
+  local data_picked="" delete_dirs=()
+  if (( ${#data_choices[@]} )); then
+    data_picked=$(choose_many "Also delete app data? (logins, settings and caches; none selected keeps all data)" "${data_choices[@]}")
+    for entry in "${remove_entries[@]}"; do
+      read_app "$entry"
+      if [[ -n ${dirs_of[$label]:-} ]] && picked_label "$label" "$data_picked"; then
+        mapfile -t -O "${#delete_dirs[@]}" delete_dirs <<<"${dirs_of[$label]}"
+      fi
+    done
+  fi
+
+  local summary="Remove ${#packages[@]} app(s): ${packages[*]}"
+  (( ${#delete_dirs[@]} )) && summary+=" and delete ${#delete_dirs[@]} data folder(s)"
+  confirm "$summary?" || return 0
+
+  sudo -v
+  for entry in "${remove_entries[@]}"; do
+    read_app "$entry"
+    stop_app "$label" "${pkg_of[$label]}"
+  done
+
+  say "Removing..."
+  pkg_drop "${packages[@]}"
+
+  for dir in "${delete_dirs[@]}"; do
+    # Only ever delete the table's folders under $HOME
+    [[ $dir == "$HOME"/?* ]] && rm -rf -- "$dir" && echo "Deleted $dir"
+  done
+
+  say "Done."
+  if (( ${#delete_dirs[@]} == 0 )); then
+    for label in "${!dirs_of[@]}"; do
+      picked_label "$label" "$picked" || continue
+      echo "  $label data kept in:"
+      sed 's/^/    /' <<<"${dirs_of[$label]}"
+    done
+  fi
+  return 0
+}
+
+case $mode in
+  install) install_apps ;;
+  remove) remove_apps ;;
+  *) update_apps ;;
+esac
