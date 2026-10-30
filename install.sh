@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install proton-apps-update and add "Update → Proton Apps" to the Omarchy menu.
+# Install proton-apps-update and add "Proton Apps" to the Omarchy Install and Update menus.
 
 set -euo pipefail
 
@@ -8,34 +8,47 @@ cd "$(dirname "$0")"
 BIN_DIR="$HOME/.local/bin"
 MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 
-ENTRY='  "update.proton": {
+UPDATE_ENTRY='  "update.proton": {
     "icon": "󰒃",
     "label": "Proton Apps",
     "aliases": ["proton"],
-    "description": "Update Proton Mail and Proton Pass from official releases",
+    "description": "Update Proton apps from official releases",
     "action": "omarchy-launch-floating-terminal-with-presentation proton-apps-update"
+  }'
+
+INSTALL_ENTRY='  "install.proton": {
+    "icon": "󰒃",
+    "label": "Proton Apps",
+    "aliases": ["proton-install"],
+    "description": "Install Proton Mail, Pass, VPN, Drive and more from official releases",
+    "action": "omarchy-launch-floating-terminal-with-presentation proton-apps-update --install"
   }'
 
 valid_jsonc() {
   sed 's|^[[:space:]]*//.*||' "$1" | jq -e . >/dev/null 2>&1
 }
 
-install -Dm755 proton-apps-update "$BIN_DIR/proton-apps-update"
-echo "Installed $BIN_DIR/proton-apps-update"
+# Adds a menu entry unless its id is already present
+add_entry() {
+  local id=$1 entry=$2 backup
 
-if [[ ! -f $MENU ]]; then
-  mkdir -p "$(dirname "$MENU")"
-  printf '{\n%s\n}\n' "$ENTRY" >"$MENU"
-  echo "Created $MENU with the Proton Apps entry"
-elif grep -q '"update.proton"' "$MENU"; then
-  echo "Menu entry already present in $MENU"
-else
-  backup="$MENU.bak.$(date +%s)"
+  if [[ ! -f $MENU ]]; then
+    mkdir -p "$(dirname "$MENU")"
+    printf '{\n%s\n}\n' "$entry" >"$MENU"
+    echo "Created $MENU with $id"
+    return
+  fi
+  if grep -q "\"$id\"" "$MENU"; then
+    echo "Menu entry $id already present"
+    return
+  fi
+
+  backup="$MENU.bak.$(date +%s%N)"
   cp "$MENU" "$backup"
 
   # Insert before the final closing brace, adding a comma after the previous
   # entry when the object isn't empty.
-  awk -v entry="$ENTRY" '
+  awk -v entry="$entry" '
     { lines[NR] = $0 }
     END {
       close_line = 0
@@ -52,18 +65,25 @@ else
     }' "$backup" >"$MENU"
 
   if valid_jsonc "$MENU"; then
-    echo "Added Proton Apps to the Update menu (backup: $backup)"
+    echo "Added $id to the menu (backup: $backup)"
   else
     cp "$backup" "$MENU"
     echo "Couldn't safely edit $MENU — left it unchanged. Add this entry by hand:" >&2
-    echo "$ENTRY" >&2
+    echo "$entry" >&2
     exit 1
   fi
-fi
+}
+
+install -Dm755 proton-apps-update "$BIN_DIR/proton-apps-update"
+echo "Installed $BIN_DIR/proton-apps-update"
+
+add_entry install.proton "$INSTALL_ENTRY"
+add_entry update.proton "$UPDATE_ENTRY"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) echo "Note: $BIN_DIR is not on your PATH; the menu entry needs it to be." >&2 ;;
+  *) echo "Note: $BIN_DIR is not on your PATH; the menu entries need it to be." >&2 ;;
 esac
 
-echo "Done. Run 'proton-apps-update --check' or use Menu → Update → Proton Apps."
+echo "Done. Use Menu → Install → Proton Apps or Menu → Update → Proton Apps,"
+echo "or run 'proton-apps-update --install' / 'proton-apps-update'."

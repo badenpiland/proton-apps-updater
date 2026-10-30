@@ -1,5 +1,5 @@
 #!/bin/bash
-# Remove proton-apps-update and its Omarchy menu entry. Installed Proton apps are left alone.
+# Remove proton-apps-update and its Omarchy menu entries. Installed Proton apps are left alone.
 
 set -euo pipefail
 
@@ -9,13 +9,13 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/proton-apps-update"
 rm -f "$HOME/.local/bin/proton-apps-update"
 echo "Removed $HOME/.local/bin/proton-apps-update"
 
-if [[ -f $MENU ]] && grep -q '"update.proton"' "$MENU"; then
+if [[ -f $MENU ]] && grep -qE '"(update|install)\.proton"' "$MENU"; then
   backup="$MENU.bak.$(date +%s)"
   cp "$MENU" "$backup"
 
-  # Drop the update.proton block, then any trailing comma left before the closing brace
+  # Drop the update.proton and install.proton blocks, then any trailing comma left before the closing brace
   awk '
-    /^[[:space:]]*"update\.proton"[[:space:]]*:/ {
+    /^[[:space:]]*"(update|install)\.proton"[[:space:]]*:/ {
       # Single-line entry ends on this line; multi-line ends at its own closing brace
       if ($0 !~ /}[[:space:]]*,?[[:space:]]*$/) skip = 1
       next
@@ -30,10 +30,10 @@ if [[ -f $MENU ]] && grep -q '"update.proton"' "$MENU"; then
     }' "$backup" >"$MENU"
 
   if sed 's|^[[:space:]]*//.*||' "$MENU" | jq -e . >/dev/null 2>&1; then
-    echo "Removed Proton Apps from the Update menu (backup: $backup)"
+    echo "Removed Proton Apps from the Install and Update menus (backup: $backup)"
   else
     cp "$backup" "$MENU"
-    echo "Couldn't safely edit $MENU — left it unchanged. Remove the \"update.proton\" entry by hand." >&2
+    echo "Couldn't safely edit $MENU — left it unchanged. Remove the \"install.proton\" and \"update.proton\" entries by hand." >&2
   fi
 fi
 

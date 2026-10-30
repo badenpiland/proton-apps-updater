@@ -1,34 +1,48 @@
 #!/bin/bash
-# Update Proton Mail and Proton Pass from Proton's official Linux releases.
+# Install and update Proton's Linux apps from Proton's official releases.
 #
-# Proton doesn't publish Arch packages, so this repackages the official .deb
-# (checksum-verified against Proton's release feed) into a local pacman
-# package named <app>-official, closes the running app, installs, and
-# relaunches anything that was open.
+# Proton doesn't publish Arch packages for most of its apps, so this
+# repackages the official .deb (or standalone binary), checksum-verified
+# against Proton's release feed, into a local pacman package named
+# <app>-official. Running apps are closed, updated and relaunched.
+# Proton VPN and Bridge come from Arch's official repos instead and are
+# kept current by normal system updates.
 #
-# Usage: proton-apps-update [--check] [--yes]
-#   --check  only report installed vs. latest stable versions
-#   --yes    don't ask for confirmation before installing
+# Usage: proton-apps-update [--check] [--yes] [--install]
+#   --check    only report installed vs. latest stable versions
+#   --yes      don't ask for confirmation before installing updates
+#   --install  pick Proton apps to install from a list
 
 set -euo pipefail
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/proton-apps-update"
 
-# name|feed url|binary in /usr/lib/<name>|description
+# id|label|kind|source|main executable
+#   deb  — official .deb from a Proton release feed, repackaged as <id>-official
+#   bin  — official standalone binary from a Proton release feed, packaged as <id>-official
+#   repo — package from Arch's official repos (updated by system updates)
 APPS=(
-  "proton-mail|https://proton.me/download/mail/linux/version.json|Proton Mail Beta|Official Proton Mail desktop application"
-  "proton-pass|https://proton.me/download/PassDesktop/linux/x64/version.json|Proton Pass|Official Proton Pass desktop application"
+  "proton-mail|Proton Mail|deb|https://proton.me/download/mail/linux/version.json|/usr/lib/proton-mail/Proton Mail Beta"
+  "proton-pass|Proton Pass|deb|https://proton.me/download/PassDesktop/linux/x64/version.json|/usr/lib/proton-pass/Proton Pass"
+  "proton-authenticator|Proton Authenticator|deb|https://proton.me/download/authenticator/linux/version.json|/usr/bin/proton-authenticator"
+  "proton-meet|Proton Meet|deb|https://proton.me/download/meet/linux/version.json|/usr/lib/proton-meet/Proton Meet Beta"
+  "proton-drive-cli|Proton Drive (CLI)|bin|https://proton.me/download/drive/cli/version.json|/usr/bin/proton-drive"
+  "proton-vpn|Proton VPN|repo|proton-vpn-gtk-app|"
+  "proton-vpn-cli|Proton VPN (CLI)|repo|proton-vpn-cli|"
+  "protonmail-bridge|Proton Mail Bridge|repo|protonmail-bridge|"
 )
 
-DEPENDS="'alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'expat' 'glib2' 'glibc' 'gtk3' 'libcups' 'libdrm' 'libgcc' 'libnotify' 'libudev.so' 'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxfixes' 'libxkbcommon' 'libxrandr' 'libxtst' 'mesa' 'nspr' 'nss' 'pango' 'xdg-utils'"
+ELECTRON_DEPENDS="'alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'expat' 'glib2' 'glibc' 'gtk3' 'libcups' 'libdrm' 'libgcc' 'libnotify' 'libudev.so' 'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxfixes' 'libxkbcommon' 'libxrandr' 'libxtst' 'mesa' 'nspr' 'nss' 'pango' 'xdg-utils'"
+WEBKIT_DEPENDS="'webkit2gtk-4.1' 'gtk3'"
 
-check_only=false
+mode=update
 assume_yes=false
 for arg in "$@"; do
   case "$arg" in
-    --check) check_only=true ;;
+    --check) mode=check ;;
+    --install) mode=install ;;
     -y|--yes) assume_yes=true ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -49,142 +63,275 @@ confirm() {
   fi
 }
 
-# Prints "version url sha512" for the newest Stable .deb in a feed
+# Prints "version url sha512" for the newest Stable release of an app in its feed
 latest_stable() {
-  curl -fsSL --retry 2 "$1" | jq -r '
+  local kind=$1 feed=$2
+  curl -fsSL --retry 2 "$feed" | jq -r --arg kind "$kind" '
     [.Releases[] | select(.CategoryName == "Stable")
-      | {v: .Version, f: ([.File[] | select(.Identifier | test("deb"))][0])}
+      | {v: .Version, f: ([(.File // .Files)[]
+          | select(if $kind == "bin" then .Platform == "linux/x64"
+                   else (.Identifier // "" | test("deb")) end)][0])}
       | select(.f != null)]
     | sort_by(.v | split(".") | map(tonumber? // 0)) | last
     | "\(.v) \(.f.Url) \(.f.Sha512CheckSum)"'
 }
 
-installed_version() {
-  pacman -Q "$1-official" 2>/dev/null | awk '{print $2}' | sed 's/-[0-9]*$//'
+# The pacman package an app is installed as, managed by this script or the repos
+package_name() {
+  [[ $2 == repo ]] && echo "$3" || echo "$1-official"
 }
 
-# PIDs whose executable is the app's main binary (any Electron child included)
+installed_version() {
+  { pacman -Q "$1" 2>/dev/null || true; } | awk '{print $2}' | sed 's/-[0-9]*$//'
+}
+
+# Another package providing the same app (e.g. an AUR -bin build), if any
+other_install() {
+  pacman -Qq 2>/dev/null | grep -E "^$1(-bin|-beta-bin|-git)?\$" | grep -vx "$1-official" | head -1 || true
+}
+
+# PIDs whose executable is the app's main binary (Electron children included)
 app_pids() {
-  local exe="/usr/lib/$1/$2" pid
+  local pid
   for pid in /proc/[0-9]*; do
-    [[ "$(readlink "$pid/exe" 2>/dev/null)" == "$exe"* ]] && echo "${pid#/proc/}"
+    [[ "$(readlink "$pid/exe" 2>/dev/null)" == "$1"* ]] && echo "${pid#/proc/}"
   done
   return 0
 }
 
 stop_app() {
-  local pids
-  pids=$(app_pids "$1" "$2")
+  local label=$1 exe=$2 pids
+  pids=$(app_pids "$exe")
   [[ -z $pids ]] && return 0
-  say "Closing $1..."
+  say "Closing $label..."
   kill $pids 2>/dev/null || true
   for _ in $(seq 20); do
-    [[ -z "$(app_pids "$1" "$2")" ]] && return 0
+    [[ -z "$(app_pids "$exe")" ]] && return 0
     sleep 0.5
   done
-  pids=$(app_pids "$1" "$2")
+  pids=$(app_pids "$exe")
   [[ -n $pids ]] && kill -9 $pids 2>/dev/null || true
 }
 
-build_package() {
-  local name=$1 binary=$2 desc=$3 version=$4 url=$5 sha=$6
-  local dir="$CACHE_DIR/$name"
-  local deb="${name}_${version}_amd64.deb"
+write_pkgbuild() {
+  local id=$1 label=$2 kind=$3 exe=$4 version=$5 url=$6 sha=$7
+  local file depends
 
-  mkdir -p "$dir"
-  rm -f "$dir"/*.pkg.tar.zst
-  cat >"$dir/PKGBUILD" <<EOF
-pkgname=$name-official
+  if [[ $kind == bin ]]; then
+    file="${id}_${version}"
+    cat <<EOF
+pkgname=$id-official
 pkgver=$version
 pkgrel=1
-pkgdesc="$desc"
+pkgdesc="Official $label"
 arch=('x86_64')
 url="https://proton.me"
 license=('custom')
-depends=($DEPENDS)
-provides=('$name')
-conflicts=('$name' '$name-bin')
+depends=('glibc')
+provides=('$id')
+conflicts=('$id' '$id-bin')
 options=('!strip' '!debug')
-source=("$deb::$url")
+source=("$file::$url")
 sha512sums=('$sha')
-noextract=("$deb")
 
 package() {
-  bsdtar -xOf "$deb" 'data.tar.*' | bsdtar -xf - -C "\$pkgdir"
-  install -Dm644 "\$pkgdir"/usr/share/doc/*/copyright "\$pkgdir/usr/share/licenses/\$pkgname/copyright"
-  rm -rf "\$pkgdir/usr/share/doc" "\$pkgdir/usr/share/lintian"
-  install -d "\$pkgdir/usr/bin"
-  ln -sf "/usr/lib/$name/$binary" "\$pkgdir/usr/bin/$name"
+  install -Dm755 "$file" "\$pkgdir$exe"
 }
 EOF
+    return
+  fi
+
+  file="${id}_${version}_amd64.deb"
+  [[ $exe == /usr/lib/* ]] && depends=$ELECTRON_DEPENDS || depends=$WEBKIT_DEPENDS
+  cat <<EOF
+pkgname=$id-official
+pkgver=$version
+pkgrel=1
+pkgdesc="Official $label desktop application"
+arch=('x86_64')
+url="https://proton.me"
+license=('custom')
+depends=($depends)
+provides=('$id')
+conflicts=('$id' '$id-bin' '$id-beta-bin')
+options=('!strip' '!debug')
+source=("$file::$url")
+sha512sums=('$sha')
+noextract=("$file")
+
+package() {
+  bsdtar -xOf "$file" 'data.tar.*' | bsdtar -xf - -C "\$pkgdir"
+  for copyright in "\$pkgdir"/usr/share/doc/*/copyright; do
+    [[ -f \$copyright ]] && install -Dm644 "\$copyright" "\$pkgdir/usr/share/licenses/\$pkgname/copyright"
+  done
+  rm -rf "\$pkgdir/usr/share/doc" "\$pkgdir/usr/share/lintian"
+  if [[ "$exe" != /usr/bin/* ]]; then
+    install -d "\$pkgdir/usr/bin"
+    ln -sf "$exe" "\$pkgdir/usr/bin/$id"
+  fi
+}
+EOF
+}
+
+# Builds <id>-official and prints the path of the resulting package file
+build_package() {
+  local id=$1 dir="$CACHE_DIR/$1"
+  mkdir -p "$dir"
+  rm -f "$dir"/*.pkg.tar.zst
+  write_pkgbuild "$@" >"$dir/PKGBUILD"
   (cd "$dir" && makepkg -f --cleanbuild --noconfirm >"$dir/build.log" 2>&1) || {
-    echo "Build failed for $name — see $dir/build.log" >&2
+    echo "Build failed for $id — see $dir/build.log" >&2
     return 1
   }
   ls "$dir"/*.pkg.tar.zst
 }
 
-pending=()
-for entry in "${APPS[@]}"; do
-  IFS='|' read -r name feed binary desc <<<"$entry"
-  current=$(installed_version "$name")
-  if ! latest=$(latest_stable "$feed") || [[ -z $latest || $latest == null* ]]; then
-    echo "$name: couldn't read Proton's release feed" >&2
-    continue
-  fi
-  read -r version url sha <<<"$latest"
-
-  if [[ -z $current ]]; then
-    other=$(pacman -Qq 2>/dev/null | grep -E "^$name(-|\$)" | head -1 || true)
-    if [[ -n $other ]]; then
-      echo "$name: installed as '$other', not $name-official — skipping (see README to switch)"
-    else
-      echo "$name: not installed (latest $version) — skipping"
-    fi
-  elif (( $(vercmp "$version" "$current") > 0 )); then
-    echo "$name: $current → $version"
-    pending+=("$entry|$version|$url|$sha")
+# Lets the user pick from "label — status" lines; prints the chosen lines
+choose_many() {
+  local header=$1; shift
+  if command -v gum >/dev/null && [[ -t 0 ]]; then
+    gum choose --no-limit --header "$header (space to select, enter to confirm)" "$@" || true
   else
-    echo "$name: $current is up to date"
+    local i=1 line picks
+    echo "$header" >&2
+    for line in "$@"; do echo "  $i) $line" >&2; i=$((i + 1)); done
+    read -rp "Numbers separated by spaces (blank to cancel): " picks
+    for i in $picks; do
+      if [[ $i =~ ^[0-9]+$ ]] && (( i >= 1 && i <= $# )); then echo "${!i}"; fi
+    done
   fi
-done
+}
 
-if (( ${#pending[@]} == 0 )); then
-  say "All Proton apps are up to date."
-  exit 0
+install_apps() {
+  local entry id label kind source exe pkg current other choices=() picked
+  for entry in "${APPS[@]}"; do
+    IFS='|' read -r id label kind source exe <<<"$entry"
+    pkg=$(package_name "$id" "$kind" "$source")
+    current=$(installed_version "$pkg")
+    [[ -n $current ]] && continue
+    other=$([[ $kind == repo ]] || other_install "$id")
+    if [[ -n $other ]]; then
+      choices+=("$label — replaces $other")
+    elif [[ $kind == repo ]]; then
+      choices+=("$label — from Arch repos")
+    else
+      choices+=("$label")
+    fi
+  done
+
+  if (( ${#choices[@]} == 0 )); then
+    say "Every Proton app is already installed."
+    return 0
+  fi
+
+  picked=$(choose_many "Select Proton apps to install" "${choices[@]}")
+  [[ -z $picked ]] && { echo "Nothing selected."; return 0; }
+
+  local packages=() repo_packages=() version url sha latest line selected
+  for entry in "${APPS[@]}"; do
+    IFS='|' read -r id label kind source exe <<<"$entry"
+    selected=false
+    while IFS= read -r line; do
+      [[ $line == "$label" || $line == "$label — "* ]] && selected=true
+    done <<<"$picked"
+    $selected || continue
+
+    if [[ $kind == repo ]]; then
+      repo_packages+=("$source")
+      continue
+    fi
+    if ! latest=$(latest_stable "$kind" "$source") || [[ -z $latest || $latest == null* ]]; then
+      echo "$label: couldn't read Proton's release feed — skipping" >&2
+      continue
+    fi
+    read -r version url sha <<<"$latest"
+    say "Downloading and packaging $label $version..."
+    packages+=("$(build_package "$id" "$label" "$kind" "$exe" "$version" "$url" "$sha")")
+  done
+
+  (( ${#packages[@]} + ${#repo_packages[@]} == 0 )) && return 1
+  sudo -v
+  # No --noconfirm: pacman asks before replacing a conflicting AUR build
+  (( ${#packages[@]} )) && sudo pacman -U "${packages[@]}"
+  (( ${#repo_packages[@]} )) && sudo pacman -S --needed "${repo_packages[@]}"
+
+  say "Done. Keep them current with 'proton-apps-update' (VPN and Bridge update with your system)."
+}
+
+update_apps() {
+  local entry id label kind source exe pkg current other latest version url sha pending=()
+  for entry in "${APPS[@]}"; do
+    IFS='|' read -r id label kind source exe <<<"$entry"
+    pkg=$(package_name "$id" "$kind" "$source")
+    current=$(installed_version "$pkg")
+
+    if [[ $kind == repo ]]; then
+      [[ -n $current ]] && echo "$label: $current (updated with system updates)"
+      continue
+    fi
+
+    if [[ -z $current ]]; then
+      other=$(other_install "$id")
+      [[ -n $other ]] && echo "$label: installed as '$other' — run 'proton-apps-update --install' to switch to the official build"
+      continue
+    fi
+
+    if ! latest=$(latest_stable "$kind" "$source") || [[ -z $latest || $latest == null* ]]; then
+      echo "$label: couldn't read Proton's release feed" >&2
+      continue
+    fi
+    read -r version url sha <<<"$latest"
+
+    if (( $(vercmp "$version" "$current") > 0 )); then
+      echo "$label: $current → $version"
+      pending+=("$entry|$version|$url|$sha")
+    else
+      echo "$label: $current is up to date"
+    fi
+  done
+
+  if (( ${#pending[@]} == 0 )); then
+    say "All installed Proton apps are up to date."
+    return 0
+  fi
+  [[ $mode == check ]] && return 0
+  confirm "Install ${#pending[@]} update(s)?" || return 0
+
+  local packages=()
+  for entry in "${pending[@]}"; do
+    IFS='|' read -r id label kind source exe version url sha <<<"$entry"
+    say "Downloading and packaging $label $version..."
+    packages+=("$(build_package "$id" "$label" "$kind" "$exe" "$version" "$url" "$sha")")
+  done
+
+  # Ask for the password before closing anything, so a cancelled prompt leaves apps running
+  sudo -v
+
+  local relaunch=()
+  for entry in "${pending[@]}"; do
+    IFS='|' read -r id label kind source exe _ <<<"$entry"
+    [[ $kind == deb && -n "$(app_pids "$exe")" ]] || continue
+    relaunch+=("$id")
+    stop_app "$label" "$exe"
+  done
+
+  say "Installing..."
+  sudo pacman -U --noconfirm "${packages[@]}"
+
+  for id in "${relaunch[@]}"; do
+    say "Restarting $id..."
+    setsid uwsm-app -- "$id" >/dev/null 2>&1 &
+  done
+
+  say "Done."
+  for entry in "${pending[@]}"; do
+    IFS='|' read -r id label _ <<<"$entry"
+    echo "  $label $(installed_version "$id-official")"
+  done
+}
+
+if [[ $mode == install ]]; then
+  install_apps
+else
+  update_apps
 fi
-$check_only && exit 0
-confirm "Install ${#pending[@]} update(s)?" || exit 0
-
-packages=()
-for entry in "${pending[@]}"; do
-  IFS='|' read -r name feed binary desc version url sha <<<"$entry"
-  say "Downloading and packaging $name $version..."
-  packages+=("$(build_package "$name" "$binary" "$desc" "$version" "$url" "$sha")")
-done
-
-# Ask for the password before closing anything, so a cancelled prompt leaves apps running
-sudo -v
-
-relaunch=()
-for entry in "${pending[@]}"; do
-  IFS='|' read -r name feed binary _ <<<"$entry"
-  if [[ -n "$(app_pids "$name" "$binary")" ]]; then
-    relaunch+=("$name")
-    stop_app "$name" "$binary"
-  fi
-done
-
-say "Installing..."
-sudo pacman -U --noconfirm "${packages[@]}"
-
-for name in "${relaunch[@]}"; do
-  say "Restarting $name..."
-  setsid uwsm-app -- "$name" >/dev/null 2>&1 &
-done
-
-say "Done."
-for entry in "${pending[@]}"; do
-  IFS='|' read -r name _ <<<"$entry"
-  echo "  $name $(installed_version "$name")"
-done
