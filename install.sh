@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install proton-apps-update and add "Proton Apps" to the Omarchy Install and Update menus.
+# Install proton-apps-update and add "Proton Apps" to the Omarchy Install, Update and Remove menus.
 
 set -euo pipefail
 
@@ -22,6 +22,14 @@ INSTALL_ENTRY='  "install.proton": {
     "aliases": ["proton-install"],
     "description": "Install Proton Mail, Pass, VPN, Drive and more from official releases",
     "action": "omarchy-launch-floating-terminal-with-presentation proton-apps-update --install"
+  }'
+
+REMOVE_ENTRY='  "remove.proton": {
+    "icon": "󰒃",
+    "label": "Proton Apps",
+    "aliases": ["proton-remove"],
+    "description": "Uninstall Proton apps, optionally deleting their data",
+    "action": "omarchy-launch-floating-terminal-with-presentation proton-apps-update --remove"
   }'
 
 valid_jsonc() {
@@ -79,11 +87,12 @@ echo "Installed $BIN_DIR/proton-apps-update"
 
 add_entry install.proton "$INSTALL_ENTRY"
 add_entry update.proton "$UPDATE_ENTRY"
+add_entry remove.proton "$REMOVE_ENTRY"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "Note: $BIN_DIR is not on your PATH; the menu entries need it to be." >&2 ;;
 esac
 
-echo "Done. Use Menu → Install → Proton Apps or Menu → Update → Proton Apps,"
-echo "or run 'proton-apps-update --install' / 'proton-apps-update'."
+echo "Done. Use Menu → Install / Update / Remove → Proton Apps,"
+echo "or run 'proton-apps-update' with --install, --remove or no options to update."
