@@ -106,6 +106,8 @@ Done.
 
 Your sudo password is requested *before* any app is closed, so cancelling leaves everything running.
 
+On a machine with no Proton apps installed, the update offers to open the install checklist instead.
+
 ### Removing Proton apps
 
 **Menu → Remove → Proton Apps**, or:
