@@ -1,0 +1,190 @@
+#!/bin/bash
+# Update Proton Mail and Proton Pass from Proton's official Linux releases.
+#
+# Proton doesn't publish Arch packages, so this repackages the official .deb
+# (checksum-verified against Proton's release feed) into a local pacman
+# package named <app>-official, closes the running app, installs, and
+# relaunches anything that was open.
+#
+# Usage: proton-apps-update [--check] [--yes]
+#   --check  only report installed vs. latest stable versions
+#   --yes    don't ask for confirmation before installing
+
+set -euo pipefail
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/proton-apps-update"
+
+# name|feed url|binary in /usr/lib/<name>|description
+APPS=(
+  "proton-mail|https://proton.me/download/mail/linux/version.json|Proton Mail Beta|Official Proton Mail desktop application"
+  "proton-pass|https://proton.me/download/PassDesktop/linux/x64/version.json|Proton Pass|Official Proton Pass desktop application"
+)
+
+DEPENDS="'alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'expat' 'glib2' 'glibc' 'gtk3' 'libcups' 'libdrm' 'libgcc' 'libnotify' 'libudev.so' 'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxfixes' 'libxkbcommon' 'libxrandr' 'libxtst' 'mesa' 'nspr' 'nss' 'pango' 'xdg-utils'"
+
+check_only=false
+assume_yes=false
+for arg in "$@"; do
+  case "$arg" in
+    --check) check_only=true ;;
+    -y|--yes) assume_yes=true ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
+
+for cmd in curl jq vercmp makepkg bsdtar; do
+  command -v "$cmd" >/dev/null || { echo "Missing required command: $cmd" >&2; exit 1; }
+done
+
+say() { printf '\e[1m%s\e[0m\n' "$*"; }
+
+confirm() {
+  $assume_yes && return 0
+  if command -v gum >/dev/null && [[ -t 0 ]]; then
+    gum confirm "$1"
+  else
+    read -rp "$1 [y/N] " reply
+    [[ $reply == [yY]* ]]
+  fi
+}
+
+# Prints "version url sha512" for the newest Stable .deb in a feed
+latest_stable() {
+  curl -fsSL --retry 2 "$1" | jq -r '
+    [.Releases[] | select(.CategoryName == "Stable")
+      | {v: .Version, f: ([.File[] | select(.Identifier | test("deb"))][0])}
+      | select(.f != null)]
+    | sort_by(.v | split(".") | map(tonumber? // 0)) | last
+    | "\(.v) \(.f.Url) \(.f.Sha512CheckSum)"'
+}
+
+installed_version() {
+  pacman -Q "$1-official" 2>/dev/null | awk '{print $2}' | sed 's/-[0-9]*$//'
+}
+
+# PIDs whose executable is the app's main binary (any Electron child included)
+app_pids() {
+  local exe="/usr/lib/$1/$2" pid
+  for pid in /proc/[0-9]*; do
+    [[ "$(readlink "$pid/exe" 2>/dev/null)" == "$exe"* ]] && echo "${pid#/proc/}"
+  done
+  return 0
+}
+
+stop_app() {
+  local pids
+  pids=$(app_pids "$1" "$2")
+  [[ -z $pids ]] && return 0
+  say "Closing $1..."
+  kill $pids 2>/dev/null || true
+  for _ in $(seq 20); do
+    [[ -z "$(app_pids "$1" "$2")" ]] && return 0
+    sleep 0.5
+  done
+  pids=$(app_pids "$1" "$2")
+  [[ -n $pids ]] && kill -9 $pids 2>/dev/null || true
+}
+
+build_package() {
+  local name=$1 binary=$2 desc=$3 version=$4 url=$5 sha=$6
+  local dir="$CACHE_DIR/$name"
+  local deb="${name}_${version}_amd64.deb"
+
+  mkdir -p "$dir"
+  rm -f "$dir"/*.pkg.tar.zst
+  cat >"$dir/PKGBUILD" <<EOF
+pkgname=$name-official
+pkgver=$version
+pkgrel=1
+pkgdesc="$desc"
+arch=('x86_64')
+url="https://proton.me"
+license=('custom')
+depends=($DEPENDS)
+provides=('$name')
+conflicts=('$name' '$name-bin')
+options=('!strip' '!debug')
+source=("$deb::$url")
+sha512sums=('$sha')
+noextract=("$deb")
+
+package() {
+  bsdtar -xOf "$deb" 'data.tar.*' | bsdtar -xf - -C "\$pkgdir"
+  install -Dm644 "\$pkgdir"/usr/share/doc/*/copyright "\$pkgdir/usr/share/licenses/\$pkgname/copyright"
+  rm -rf "\$pkgdir/usr/share/doc" "\$pkgdir/usr/share/lintian"
+  install -d "\$pkgdir/usr/bin"
+  ln -sf "/usr/lib/$name/$binary" "\$pkgdir/usr/bin/$name"
+}
+EOF
+  (cd "$dir" && makepkg -f --cleanbuild --noconfirm >"$dir/build.log" 2>&1) || {
+    echo "Build failed for $name — see $dir/build.log" >&2
+    return 1
+  }
+  ls "$dir"/*.pkg.tar.zst
+}
+
+pending=()
+for entry in "${APPS[@]}"; do
+  IFS='|' read -r name feed binary desc <<<"$entry"
+  current=$(installed_version "$name")
+  if ! latest=$(latest_stable "$feed") || [[ -z $latest || $latest == null* ]]; then
+    echo "$name: couldn't read Proton's release feed" >&2
+    continue
+  fi
+  read -r version url sha <<<"$latest"
+
+  if [[ -z $current ]]; then
+    other=$(pacman -Qq 2>/dev/null | grep -E "^$name(-|\$)" | head -1 || true)
+    if [[ -n $other ]]; then
+      echo "$name: installed as '$other', not $name-official — skipping (see README to switch)"
+    else
+      echo "$name: not installed (latest $version) — skipping"
+    fi
+  elif (( $(vercmp "$version" "$current") > 0 )); then
+    echo "$name: $current → $version"
+    pending+=("$entry|$version|$url|$sha")
+  else
+    echo "$name: $current is up to date"
+  fi
+done
+
+if (( ${#pending[@]} == 0 )); then
+  say "All Proton apps are up to date."
+  exit 0
+fi
+$check_only && exit 0
+confirm "Install ${#pending[@]} update(s)?" || exit 0
+
+packages=()
+for entry in "${pending[@]}"; do
+  IFS='|' read -r name feed binary desc version url sha <<<"$entry"
+  say "Downloading and packaging $name $version..."
+  packages+=("$(build_package "$name" "$binary" "$desc" "$version" "$url" "$sha")")
+done
+
+# Ask for the password before closing anything, so a cancelled prompt leaves apps running
+sudo -v
+
+relaunch=()
+for entry in "${pending[@]}"; do
+  IFS='|' read -r name feed binary _ <<<"$entry"
+  if [[ -n "$(app_pids "$name" "$binary")" ]]; then
+    relaunch+=("$name")
+    stop_app "$name" "$binary"
+  fi
+done
+
+say "Installing..."
+sudo pacman -U --noconfirm "${packages[@]}"
+
+for name in "${relaunch[@]}"; do
+  say "Restarting $name..."
+  setsid uwsm-app -- "$name" >/dev/null 2>&1 &
+done
+
+say "Done."
+for entry in "${pending[@]}"; do
+  IFS='|' read -r name _ <<<"$entry"
+  echo "  $name $(installed_version "$name")"
+done
